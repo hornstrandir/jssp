@@ -1,6 +1,7 @@
 import gym
 import datetime
 import numpy as np
+import bisect
 from pathlib import Path
 import random
 
@@ -138,8 +139,7 @@ class JssEnv(gym.Env):
         self.state = np.zeros((self.jobs, 7), dtype=float)
         return self._get_current_state_representation()
 
-
-    def _priorization_non_final(self):
+    def _prioritization_non_final(self):
         """
         Set legal action of final job to False and reduce the number of legal actions 
         by one, if there is a non-final job that can be allocated to the same machine.
@@ -188,19 +188,260 @@ class JssEnv(gym.Env):
                         self.nb_legal_actions -= 1
 
     def _check_no_op(self):
-        pass
+        self.legal_actions[self.jobs] = False
+        if (
+            len(self.next_time_step) > 0
+            and self.nb_machine_legal <= 3
+            and self.nb_legal_actions <= 4
+        ):
+            machine_next = set()
+            next_time_step = self.next_time_step[0]
+            max_horizon = self.current_time_step
+            max_horizon_machine = [
+                self.current_time_step + self.max_time_op for _ in range(self.machines)
+            ]
+            for job in range(self.jobs):
+                if self.legal_actions[job]:
+                    time_step = self.todo_time_step_job[job]
+                    machine_needed = self.instance_matrix[job][time_step][0]
+                    time_needed = self.instance_matrix[job][time_step][1]
+                    end_job = self.current_time_step + time_needed
+                    if end_job < next_time_step:
+                        return
+                    max_horizon_machine[machine_needed] = min(
+                        max_horizon_machine[machine_needed], end_job
+                    )
+                    max_horizon = max(max_horizon, max_horizon_machine[machine_needed])
+            for job in range(self.jobs):
+                if not self.legal_actions[job]:
+                    if (
+                        self.time_until_finish_current_op_jobs[job] > 0
+                        and self.todo_time_step_job[job] + 1 < self.machines
+                    ):
+                        time_step = self.todo_time_step_job[job] + 1
+                        time_needed = (
+                            self.current_time_step
+                            + self.time_until_finish_current_op_jobs[job]
+                        )
+                        while (
+                            time_step < self.machines - 1 and max_horizon > time_needed
+                        ):
+                            machine_needed = self.instance_matrix[job][time_step][0]
+                            if (
+                                max_horizon_machine[machine_needed] > time_needed
+                                and self.machine_legal[machine_needed]
+                            ):
+                                machine_next.add(machine_needed)
+                                if len(machine_next) == self.nb_machine_legal:
+                                    self.legal_actions[self.jobs] = True
+                                    return
+                            time_needed += self.instance_matrix[job][time_step][1]
+                            time_step += 1
+                    elif (
+                        not self.action_illegal_no_op[job]
+                        and self.todo_time_step_job[job] < self.machines
+                    ):
+                        time_step = self.todo_time_step_job[job]
+                        machine_needed = self.instance_matrix[job][time_step][0]
+                        time_needed = (
+                            self.current_time_step
+                            + self.time_until_available_machine[machine_needed]
+                        )
+                        while (
+                            time_step < self.machines - 1 and max_horizon > time_needed
+                        ):
+                            machine_needed = self.instance_matrix[job][time_step][0]
+                            if (
+                                max_horizon_machine[machine_needed] > time_needed
+                                and self.machine_legal[machine_needed]
+                            ):
+                                machine_next.add(machine_needed)
+                                if len(machine_next) == self.nb_machine_legal:
+                                    self.legal_actions[self.jobs] = True
+                                    return
+                            time_needed += self.instance_matrix[job][time_step][1]
+                            time_step += 1
 
-    def step(self):
-        print('Step successful')
+    def step(self, action: int):
+        reward = 0.0
+        if action == self.jobs:
+            self.nb_machine_legal = 0
+            self.nb_legal_actions = 0
+            for job in range(self.jobs):
+                if self.legal_actions[job]:
+                    self.legal_actions[job] = False
+                    needed_machine = self.needed_machine_jobs[job]
+                    self.machine_legal[needed_machine] = False
+                    self.illegal_actions[needed_machine][job] = True
+                    self.action_illegal_no_op[job] = True
+            while self.nb_machine_legal == 0:
+                reward -= self.increase_time_step()
+            scaled_reward = self._reward_scaler(reward)
+            self._prioritization_non_final()
+            self._check_no_op()
+            return (
+                self._get_current_state_representation(),
+                scaled_reward,
+                self._is_done(),
+                {},
+            )
+        else:
+            current_time_step_job = self.todo_time_step_job[action]
+            machine_needed = self.needed_machine_jobs[action]
+            time_needed = self.instance_matrix[action][current_time_step_job][1]
+            reward += time_needed
+            self.time_until_available_machine[machine_needed] = time_needed
+            self.time_until_finish_current_op_jobs[action] = time_needed
+            self.state[action][1] = time_needed / self.max_time_op
+            to_add_time_step = self.current_time_step + time_needed
+            if to_add_time_step not in self.next_time_step:
+                index = bisect.bisect_left(self.next_time_step, to_add_time_step)
+                self.next_time_step.insert(index, to_add_time_step)
+                self.next_jobs.insert(index, action)
+            self.solution[action][current_time_step_job] = self.current_time_step
+            for job in range(self.jobs):
+                if (
+                    self.needed_machine_jobs[job] == machine_needed
+                    and self.legal_actions[job]
+                ):
+                    self.legal_actions[job] = False
+                    self.nb_legal_actions -= 1
+            self.nb_machine_legal -= 1
+            self.machine_legal[machine_needed] = False
+            for job in range(self.jobs):
+                if self.illegal_actions[machine_needed][job]:
+                    self.action_illegal_no_op[job] = False
+                    self.illegal_actions[machine_needed][job] = False
+            # if we can't allocate new job in the current timestep, we pass to the next one
+            while self.nb_machine_legal == 0 and len(self.next_time_step) > 0:
+                reward -= self.increase_time_step()
+            self._prioritization_non_final()
+            self._check_no_op()
+            # we then need to scale the reward
+            scaled_reward = self._reward_scaler(reward)
+            return (
+                self._get_current_state_representation(),
+                scaled_reward,
+                self._is_done(),
+                {},
+            )
 
-    def _reward_scaler(self):
-        pass
+    def _reward_scaler(self, reward):
+        return reward / self.max_time_op
 
     def increase_time_step(self):
-        pass
+        """
+        The heart of the logic his here, we need to increase every counter when we have a nope action called
+        and return the time elapsed
+        :return: time elapsed
+        """
+        hole_planning = 0
+        next_time_step_to_pick = self.next_time_step.pop(0)
+        self.next_jobs.pop(0)
+        difference = next_time_step_to_pick - self.current_time_step
+        self.current_time_step = next_time_step_to_pick
+        for job in range(self.jobs):
+            was_left_time = self.time_until_finish_current_op_jobs[job]
+            if was_left_time > 0:
+                performed_op_job = min(difference, was_left_time)
+                self.time_until_finish_current_op_jobs[job] = max(
+                    0, self.time_until_finish_current_op_jobs[job] - difference
+                )
+                self.state[job][1] = (
+                    self.time_until_finish_current_op_jobs[job] / self.max_time_op
+                )
+                self.total_perform_op_time_jobs[job] += performed_op_job
+                self.state[job][3] = (
+                    self.total_perform_op_time_jobs[job] / self.max_time_jobs
+                )
+                if self.time_until_finish_current_op_jobs[job] == 0:
+                    self.total_idle_time_jobs[job] += difference - was_left_time
+                    self.state[job][6] = self.total_idle_time_jobs[job] / self.sum_op
+                    self.idle_time_jobs_last_op[job] = difference - was_left_time
+                    self.state[job][5] = self.idle_time_jobs_last_op[job] / self.sum_op
+                    self.todo_time_step_job[job] += 1
+                    self.state[job][2] = self.todo_time_step_job[job] / self.machines
+                    if self.todo_time_step_job[job] < self.machines:
+                        self.needed_machine_jobs[job] = self.instance_matrix[job][
+                            self.todo_time_step_job[job]
+                        ][0]
+                        self.state[job][4] = (
+                            max(
+                                0,
+                                self.time_until_available_machine[
+                                    self.needed_machine_jobs[job]
+                                ]
+                                - difference,
+                            )
+                            / self.max_time_op
+                        )
+                    else:
+                        self.needed_machine_jobs[job] = -1
+                        # this allow to have 1 is job is over (not 0 because, 0 strongly indicate that the job is a
+                        # good candidate)
+                        self.state[job][4] = 1.0
+                        if self.legal_actions[job]:
+                            self.legal_actions[job] = False
+                            self.nb_legal_actions -= 1
+            elif self.todo_time_step_job[job] < self.machines:
+                self.total_idle_time_jobs[job] += difference
+                self.idle_time_jobs_last_op[job] += difference
+                self.state[job][5] = self.idle_time_jobs_last_op[job] / self.sum_op
+                self.state[job][6] = self.total_idle_time_jobs[job] / self.sum_op
+        for machine in range(self.machines):
+            if self.time_until_available_machine[machine] < difference:
+                empty = difference - self.time_until_available_machine[machine]
+                hole_planning += empty
+            self.time_until_available_machine[machine] = max(
+                0, self.time_until_available_machine[machine] - difference
+            )
+            if self.time_until_available_machine[machine] == 0:
+                for job in range(self.jobs):
+                    if (
+                        self.needed_machine_jobs[job] == machine
+                        and not self.legal_actions[job]
+                        and not self.illegal_actions[machine][job]
+                    ):
+                        self.legal_actions[job] = True
+                        self.nb_legal_actions += 1
+                        if not self.machine_legal[machine]:
+                            self.machine_legal[machine] = True
+                            self.nb_machine_legal += 1
+        return hole_planning
 
     def _is_done(self):
-        pass
+        if self.nb_legal_actions == 0:
+            self.last_time_step = self.current_time_step
+            return True
+        return False
 
-    def render(self):
-        pass
+    def render(self, mode="human"):
+        df = []
+        for job in range(self.jobs):
+            i = 0
+            while i < self.machines and self.solution[job][i] != -1:
+                dict_op = dict()
+                dict_op["Task"] = "Job {}".format(job)
+                start_sec = self.start_timestamp + self.solution[job][i]
+                finish_sec = start_sec + self.instance_matrix[job][i][1]
+                dict_op["Start"] = datetime.datetime.fromtimestamp(start_sec)
+                dict_op["Finish"] = datetime.datetime.fromtimestamp(finish_sec)
+                dict_op["Resource"] = "Machine {}".format(
+                    self.instance_matrix[job][i][0]
+                )
+                df.append(dict_op)
+                i += 1
+        fig = None
+        if len(df) > 0:
+            df = pd.DataFrame(df)
+            fig = ff.create_gantt(
+                df,
+                index_col="Resource",
+                colors=self.colors,
+                show_colorbar=True,
+                group_tasks=True,
+            )
+            fig.update_yaxes(
+                autorange="reversed"
+            )  # otherwise tasks are listed from the bottom up
+        return fig
