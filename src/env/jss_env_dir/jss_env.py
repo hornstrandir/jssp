@@ -29,14 +29,14 @@ class JssEnv(gym.Env):
         self.current_time_step = float("inf")
         self.next_time_step = list()
         self.next_jobs = list()
-        self.legal_actions = None
-        self.time_until_available_machine = None
-        self.time_until_finish_current_op_jobs = None
-        self.todo_time_step_job = None
-        self.total_perform_op_time_jobs = None
-        self.needed_machine_jobs = None
-        self.total_idle_time_jobs = None
-        self.idle_time_jobs_last_op = None
+        self.legal_actions = None # (a1) boolean to indicate if job can be allocated
+        self.time_until_available_machine = None # (a5) required time until machine is free 
+        self.time_until_finish_current_op_jobs = None # (a2) left-over time for currently performed operation on the job
+        self.todo_time_step_job = None # (a4) left-over time until completion of job
+        self.total_perform_op_time_jobs = None # (a3) percentage of op finished for a job
+        self.needed_machine_jobs = None # 
+        self.total_idle_time_jobs = None #(a7) cumulative job's idle time in the schedule
+        self.idle_time_jobs_last_op = None # (a6) Idle time since last job's performed operation
         self.state = None
         self.illegal_actions = None
         self.action_illegal_no_op = None
@@ -98,17 +98,46 @@ class JssEnv(gym.Env):
         )
 
 
-
-
-
     def _get_current_state_representation(self):
-        pass
+        self.state[:,0] = self.legal_actions[:-1]
+        return {
+            "real_obs": self.state,
+            "action_mask": self.legal_actions, 
+        }
 
     def get_legal_actions(self):
-        pass
+        return self.legal_actions
 
     def reset(self):
-        print('Env reset')
+        self.current_time_step = 0
+        self.next_time_step = list()
+        self.next_jobs = list()
+        self.nb_legal_actions = self.jobs
+        self.nb_machine_legal = 0
+        # represent all legal actions
+        self.legal_actions = np.ones(self.jobs+1, dtype=bool)
+        self.legal_actions[self.jobs] = False
+        # used to represent the solution
+        self.solution = np.full((self.jobs, self.machines), -1, dtype=int)
+        self.time_until_available_machine = np.zeros(self.machines, dtype=int)
+        self.time_until_finish_current_op_jobs = np.zeros(self.jobs, dtype=int)
+        self.todo_time_step_job = np.zeros(self.jobs, dtype=int)
+        self.total_perform_op_time_jobs = np.zeros(self.jobs, dtype=int)
+        self.needed_machine_jobs = np.zeros(self.jobs, dtype=int)
+        self.total_idle_time_jobs = np.zeros(self.jobs, dtype=int)
+        self.idle_time_jobs_last_op = np.zeros(self.jobs, dtype=int)
+        self.illegal_actions = np.zeros((self.machines, self.jobs), dtype=bool)
+        self.action_illegal_no_op = np.zeros(self.jobs, dtype=bool)
+        self.machine_legal = np.zeros(self.machines, dtype=bool)
+        for nb_job in range(self.jobs):
+            needed_machine = self.instance_matrix[nb_job][0][0]
+            self.needed_machine_jobs[nb_job] = needed_machine
+            if not self.machine_legal[needed_machine]:
+                self.machine_legal[needed_machine] = True
+                self.nb_machine_legal += 1
+        self.state = np.zeros((self.jobs, 7), dtype=float)
+        return self._get_current_state_representation()
+
 
     def priorization_non_final(self):
         pass
